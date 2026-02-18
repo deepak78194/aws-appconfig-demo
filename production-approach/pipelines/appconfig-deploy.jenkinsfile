@@ -1,0 +1,568 @@
+#!/usr/bin/env groovy
+
+/*
+ * AWS AppConfig Configuration Deployment Pipeline
+ * 
+ * This pipeline manages AppConfig configurations using Git as the source of truth.
+ * It supports three main actions:
+ * 1. deploy-config: Deploy configuration from Git to AppConfig
+ * 2. create-infra: Create new AppConfig infrastructure via CloudFormation
+ * 3. update-infra: Update existing AppConfig infrastructure
+ */
+
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['deploy-config', 'create-infra', 'update-infra'],
+            description: 'Action to perform: deploy-config (deploy config from Git), create-infra (create new stack), update-infra (update existing stack)'
+        )
+        choice(
+            name: 'ASSET_GROUP',
+            choices: ['cdc1c', 'cdc4c', 'cdc7c', 'pdc1c'],
+            description: 'Environment/Asset Group (maps to configuration file)'
+        )
+        string(
+            name: 'ASSET_ID',
+            defaultValue: '10',
+            description: 'Asset ID (numeric identifier, e.g., 10)'
+        )
+        string(
+            name: 'ASSET_NAME',
+            defaultValue: 'auth',
+            description: 'Asset Name (e.g., auth, payment, notification)'
+        )
+        string(
+            name: 'ASSET_SERVICE',
+            defaultValue: 'authapi',
+            description: 'Service Name (e.g., authapi, paymentapi)'
+        )
+        choice(
+            name: 'DEPLOYMENT_STRATEGY',
+            choices: ['Immediate', 'Canary'],
+            description: 'Deployment strategy: Immediate (fast) or Canary (gradual rollout)'
+        )
+        booleanParam(
+            name: 'DEPLOY_INITIAL_CONFIG',
+            defaultValue: false,
+            description: 'Deploy initial configuration when creating infrastructure (only for create-infra action)'
+        )
+    }
+    
+    environment {
+        // Construct stack name using naming convention
+        STACK_NAME = "appconfig-${params.ASSET_NAME}-${params.ASSET_ID}-${params.ASSET_GROUP}"
+        CONFIG_FILE = "production-approach/config/${params.ASSET_GROUP}.json"
+        CFN_TEMPLATE = "production-approach/infra/appconfig-service.yml"
+        AWS_REGION = "${env.AWS_DEFAULT_REGION ?: 'us-east-1'}"
+        GIT_COMMIT_SHA = "${env.GIT_COMMIT ?: 'unknown'}"
+    }
+    
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "=== Parameter Validation ==="
+                    echo "ACTION: ${params.ACTION}"
+                    echo "ASSET_GROUP: ${params.ASSET_GROUP}"
+                    echo "ASSET_ID: ${params.ASSET_ID}"
+                    echo "ASSET_NAME: ${params.ASSET_NAME}"
+                    echo "ASSET_SERVICE: ${params.ASSET_SERVICE}"
+                    echo "DEPLOYMENT_STRATEGY: ${params.DEPLOYMENT_STRATEGY}"
+                    echo "STACK_NAME: ${env.STACK_NAME}"
+                    echo "CONFIG_FILE: ${env.CONFIG_FILE}"
+                    echo "GIT_COMMIT: ${env.GIT_COMMIT_SHA}"
+                    
+                    // Validate ASSET_ID is numeric
+                    if (!params.ASSET_ID.matches('^[0-9]+$')) {
+                        error("ASSET_ID must be numeric. Provided: ${params.ASSET_ID}")
+                    }
+                    
+                    // Validate ASSET_NAME format
+                    if (!params.ASSET_NAME.matches('^[a-z][a-z0-9-]*$')) {
+                        error("ASSET_NAME must start with lowercase letter and contain only lowercase letters, numbers, and hyphens. Provided: ${params.ASSET_NAME}")
+                    }
+                    
+                    // Validate ASSET_SERVICE format
+                    if (!params.ASSET_SERVICE.matches('^[a-z][a-z0-9-]*$')) {
+                        error("ASSET_SERVICE must start with lowercase letter and contain only lowercase letters, numbers, and hyphens. Provided: ${params.ASSET_SERVICE}")
+                    }
+                }
+            }
+        }
+        
+        stage('Check Configuration File') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Checking Configuration File ==="
+                    if (!fileExists(env.CONFIG_FILE)) {
+                        error("Configuration file not found: ${env.CONFIG_FILE}")
+                    }
+                    echo "✓ Configuration file exists: ${env.CONFIG_FILE}"
+                }
+            }
+        }
+        
+        stage('Validate JSON Syntax') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Validating JSON Syntax ==="
+                    try {
+                        def configContent = readFile(env.CONFIG_FILE)
+                        def jsonSlurper = new groovy.json.JsonSlurper()
+                        def config = jsonSlurper.parseText(configContent)
+                        
+                        // Validate required sections
+                        if (!config.containsKey('featureFlags')) {
+                            error("Configuration missing required 'featureFlags' section")
+                        }
+                        if (!config.containsKey('settings')) {
+                            error("Configuration missing required 'settings' section")
+                        }
+                        
+                        echo "✓ JSON syntax is valid"
+                        echo "✓ Required sections present: featureFlags, settings"
+                        echo "Configuration preview:"
+                        echo configContent
+                    } catch (Exception e) {
+                        error("Invalid JSON in configuration file: ${e.message}")
+                    }
+                }
+            }
+        }
+        
+        stage('Check CloudFormation Stack') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Checking CloudFormation Stack ==="
+                    try {
+                        def stackStatus = sh(
+                            script: """
+                                aws cloudformation describe-stacks \
+                                    --stack-name ${env.STACK_NAME} \
+                                    --region ${env.AWS_REGION} \
+                                    --query 'Stacks[0].StackStatus' \
+                                    --output text
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "Stack Status: ${stackStatus}"
+                        
+                        if (stackStatus in ['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE']) {
+                            echo "✓ Stack exists and is in a valid state"
+                        } else {
+                            error("Stack ${env.STACK_NAME} is in invalid state: ${stackStatus}")
+                        }
+                    } catch (Exception e) {
+                        error("CloudFormation stack ${env.STACK_NAME} does not exist. Please create infrastructure first using 'create-infra' action.")
+                    }
+                }
+            }
+        }
+        
+        stage('Create/Update Infrastructure') {
+            when {
+                expression { params.ACTION in ['create-infra', 'update-infra'] }
+            }
+            steps {
+                script {
+                    echo "=== ${params.ACTION == 'create-infra' ? 'Creating' : 'Updating'} Infrastructure ==="
+                    
+                    def deployInitialConfig = params.DEPLOY_INITIAL_CONFIG ? 'yes' : 'no'
+                    def initialConfigContent = ''
+                    
+                    if (params.ACTION == 'create-infra' && params.DEPLOY_INITIAL_CONFIG) {
+                        initialConfigContent = readFile(env.CONFIG_FILE).replaceAll('\n', '').replaceAll(' ', '')
+                    }
+                    
+                    def cfnCommand = """
+                        aws cloudformation ${params.ACTION == 'create-infra' ? 'create-stack' : 'update-stack'} \
+                            --stack-name ${env.STACK_NAME} \
+                            --template-body file://${env.CFN_TEMPLATE} \
+                            --parameters \
+                                ParameterKey=AssetId,ParameterValue=${params.ASSET_ID} \
+                                ParameterKey=AssetName,ParameterValue=${params.ASSET_NAME} \
+                                ParameterKey=AssetGroup,ParameterValue=${params.ASSET_GROUP} \
+                                ParameterKey=AssetService,ParameterValue=${params.ASSET_SERVICE} \
+                                ParameterKey=DeployInitialConfig,ParameterValue=${deployInitialConfig}
+                    """
+                    
+                    if (params.ACTION == 'create-infra' && params.DEPLOY_INITIAL_CONFIG && initialConfigContent) {
+                        cfnCommand += """ \
+                                ParameterKey=InitialConfigContent,ParameterValue='${initialConfigContent}'
+                        """
+                    }
+                    
+                    cfnCommand += """ \
+                            --region ${env.AWS_REGION} \
+                            --tags \
+                                Key=AssetId,Value=${params.ASSET_ID} \
+                                Key=AssetName,Value=${params.ASSET_NAME} \
+                                Key=AssetGroup,Value=${params.ASSET_GROUP} \
+                                Key=Service,Value=${params.ASSET_SERVICE} \
+                                Key=ManagedBy,Value=Jenkins \
+                                Key=GitCommit,Value=${env.GIT_COMMIT_SHA}
+                    """
+                    
+                    try {
+                        sh(cfnCommand)
+                        echo "✓ Stack ${params.ACTION == 'create-infra' ? 'creation' : 'update'} initiated"
+                    } catch (Exception e) {
+                        if (e.message.contains('No updates are to be performed')) {
+                            echo "⚠ No updates needed for stack"
+                        } else {
+                            throw e
+                        }
+                    }
+                    
+                    // Wait for stack operation to complete
+                    echo "Waiting for stack operation to complete..."
+                    sh """
+                        aws cloudformation wait stack-${params.ACTION == 'create-infra' ? 'create' : 'update'}-complete \
+                            --stack-name ${env.STACK_NAME} \
+                            --region ${env.AWS_REGION}
+                    """
+                    echo "✓ Stack operation completed successfully"
+                }
+            }
+        }
+        
+        stage('Get AppConfig IDs') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Retrieving AppConfig Resource IDs from CloudFormation ==="
+                    
+                    // Get Application ID
+                    env.APP_ID = sh(
+                        script: """
+                            aws cloudformation describe-stacks \
+                                --stack-name ${env.STACK_NAME} \
+                                --region ${env.AWS_REGION} \
+                                --query 'Stacks[0].Outputs[?OutputKey==`ApplicationId`].OutputValue' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Get Environment ID
+                    env.ENV_ID = sh(
+                        script: """
+                            aws cloudformation describe-stacks \
+                                --stack-name ${env.STACK_NAME} \
+                                --region ${env.AWS_REGION} \
+                                --query 'Stacks[0].Outputs[?OutputKey==`EnvironmentId`].OutputValue' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Get Configuration Profile ID
+                    env.CONFIG_PROFILE_ID = sh(
+                        script: """
+                            aws cloudformation describe-stacks \
+                                --stack-name ${env.STACK_NAME} \
+                                --region ${env.AWS_REGION} \
+                                --query 'Stacks[0].Outputs[?OutputKey==`ConfigurationProfileId`].OutputValue' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    // Get Deployment Strategy ID
+                    def strategyOutputKey = params.DEPLOYMENT_STRATEGY == 'Immediate' ? 
+                        'DeploymentStrategyImmediateId' : 'DeploymentStrategyCanaryId'
+                    env.DEPLOYMENT_STRATEGY_ID = sh(
+                        script: """
+                            aws cloudformation describe-stacks \
+                                --stack-name ${env.STACK_NAME} \
+                                --region ${env.AWS_REGION} \
+                                --query 'Stacks[0].Outputs[?OutputKey==`${strategyOutputKey}`].OutputValue' \
+                                --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "✓ Application ID: ${env.APP_ID}"
+                    echo "✓ Environment ID: ${env.ENV_ID}"
+                    echo "✓ Configuration Profile ID: ${env.CONFIG_PROFILE_ID}"
+                    echo "✓ Deployment Strategy ID: ${env.DEPLOYMENT_STRATEGY_ID}"
+                }
+            }
+        }
+        
+        stage('Get Current Configuration') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Retrieving Current Configuration ==="
+                    try {
+                        def currentConfig = sh(
+                            script: """
+                                aws appconfig get-hosted-configuration-version \
+                                    --application-id ${env.APP_ID} \
+                                    --configuration-profile-id ${env.CONFIG_PROFILE_ID} \
+                                    --version-number \$(aws appconfig list-hosted-configuration-versions \
+                                        --application-id ${env.APP_ID} \
+                                        --configuration-profile-id ${env.CONFIG_PROFILE_ID} \
+                                        --region ${env.AWS_REGION} \
+                                        --query 'Items[0].VersionNumber' \
+                                        --output text) \
+                                    --region ${env.AWS_REGION} \
+                                    /tmp/current-config.json
+                                cat /tmp/current-config.json
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        echo "Current configuration:"
+                        echo currentConfig
+                    } catch (Exception e) {
+                        echo "⚠ No existing configuration found (this might be the first deployment)"
+                    }
+                }
+            }
+        }
+        
+        stage('Create Configuration Version') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Creating New Configuration Version from Git ==="
+                    
+                    def configContent = readFile(env.CONFIG_FILE)
+                    
+                    // Create hosted configuration version
+                    def versionInfo = sh(
+                        script: """
+                            aws appconfig create-hosted-configuration-version \
+                                --application-id ${env.APP_ID} \
+                                --configuration-profile-id ${env.CONFIG_PROFILE_ID} \
+                                --content file://${env.CONFIG_FILE} \
+                                --content-type 'application/json' \
+                                --description 'Deployed from Git commit ${env.GIT_COMMIT_SHA}' \
+                                --region ${env.AWS_REGION} \
+                                --output json
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    def jsonSlurper = new groovy.json.JsonSlurper()
+                    def versionData = jsonSlurper.parseText(versionInfo)
+                    env.VERSION_NUMBER = versionData.VersionNumber.toString()
+                    
+                    echo "✓ Created configuration version: ${env.VERSION_NUMBER}"
+                    echo "Configuration content:"
+                    echo configContent
+                }
+            }
+        }
+        
+        stage('Start Deployment') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Starting AppConfig Deployment ==="
+                    
+                    def deploymentInfo = sh(
+                        script: """
+                            aws appconfig start-deployment \
+                                --application-id ${env.APP_ID} \
+                                --environment-id ${env.ENV_ID} \
+                                --configuration-profile-id ${env.CONFIG_PROFILE_ID} \
+                                --configuration-version ${env.VERSION_NUMBER} \
+                                --deployment-strategy-id ${env.DEPLOYMENT_STRATEGY_ID} \
+                                --description 'Git commit: ${env.GIT_COMMIT_SHA}, Strategy: ${params.DEPLOYMENT_STRATEGY}' \
+                                --region ${env.AWS_REGION} \
+                                --output json
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    def jsonSlurper = new groovy.json.JsonSlurper()
+                    def deploymentData = jsonSlurper.parseText(deploymentInfo)
+                    env.DEPLOYMENT_NUMBER = deploymentData.DeploymentNumber.toString()
+                    
+                    echo "✓ Deployment started"
+                    echo "Deployment Number: ${env.DEPLOYMENT_NUMBER}"
+                    echo "Configuration Version: ${env.VERSION_NUMBER}"
+                    echo "Strategy: ${params.DEPLOYMENT_STRATEGY}"
+                }
+            }
+        }
+        
+        stage('Monitor Deployment') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Monitoring Deployment Progress ==="
+                    
+                    def maxAttempts = 30
+                    def attemptCount = 0
+                    def deploymentComplete = false
+                    
+                    while (attemptCount < maxAttempts && !deploymentComplete) {
+                        sleep(time: 10, unit: 'SECONDS')
+                        attemptCount++
+                        
+                        def deploymentStatus = sh(
+                            script: """
+                                aws appconfig get-deployment \
+                                    --application-id ${env.APP_ID} \
+                                    --environment-id ${env.ENV_ID} \
+                                    --deployment-number ${env.DEPLOYMENT_NUMBER} \
+                                    --region ${env.AWS_REGION} \
+                                    --output json
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        def jsonSlurper = new groovy.json.JsonSlurper()
+                        def deploymentData = jsonSlurper.parseText(deploymentStatus)
+                        def state = deploymentData.State
+                        def percentageComplete = deploymentData.PercentageComplete
+                        
+                        echo "Attempt ${attemptCount}/${maxAttempts}: Status=${state}, Progress=${percentageComplete}%"
+                        
+                        if (state == 'COMPLETE') {
+                            deploymentComplete = true
+                            echo "✓ Deployment completed successfully!"
+                        } else if (state in ['ROLLED_BACK', 'BAKING']) {
+                            if (state == 'BAKING') {
+                                echo "⏰ Deployment is in baking phase..."
+                                deploymentComplete = true
+                            } else {
+                                error("Deployment was rolled back")
+                            }
+                        }
+                    }
+                    
+                    if (!deploymentComplete) {
+                        error("Deployment monitoring timeout after ${maxAttempts} attempts")
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            when {
+                expression { params.ACTION == 'deploy-config' }
+            }
+            steps {
+                script {
+                    echo "=== Verifying Deployed Configuration ==="
+                    
+                    def deployedConfig = sh(
+                        script: """
+                            aws appconfig get-hosted-configuration-version \
+                                --application-id ${env.APP_ID} \
+                                --configuration-profile-id ${env.CONFIG_PROFILE_ID} \
+                                --version-number ${env.VERSION_NUMBER} \
+                                --region ${env.AWS_REGION} \
+                                /tmp/deployed-config.json
+                            cat /tmp/deployed-config.json
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    def sourceConfig = readFile(env.CONFIG_FILE)
+                    
+                    // Parse and compare JSON
+                    def jsonSlurper = new groovy.json.JsonSlurper()
+                    def deployedJson = jsonSlurper.parseText(deployedConfig)
+                    def sourceJson = jsonSlurper.parseText(sourceConfig)
+                    
+                    if (deployedJson == sourceJson) {
+                        echo "✓ Verification successful: Deployed configuration matches source file"
+                    } else {
+                        echo "⚠ Warning: Deployed configuration differs from source"
+                        echo "Deployed config:"
+                        echo deployedConfig
+                        echo "Source config:"
+                        echo sourceConfig
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                if (params.ACTION == 'deploy-config') {
+                    echo """
+                    ╔════════════════════════════════════════════════════════╗
+                    ║          DEPLOYMENT COMPLETED SUCCESSFULLY             ║
+                    ╚════════════════════════════════════════════════════════╝
+                    
+                    Stack Name:           ${env.STACK_NAME}
+                    Environment:          ${params.ASSET_GROUP}
+                    Configuration File:   ${env.CONFIG_FILE}
+                    Version:              ${env.VERSION_NUMBER}
+                    Deployment:           ${env.DEPLOYMENT_NUMBER}
+                    Strategy:             ${params.DEPLOYMENT_STRATEGY}
+                    Git Commit:           ${env.GIT_COMMIT_SHA}
+                    
+                    Your configuration has been successfully deployed!
+                    """
+                } else {
+                    echo """
+                    ╔════════════════════════════════════════════════════════╗
+                    ║       INFRASTRUCTURE ${params.ACTION == 'create-infra' ? 'CREATED' : 'UPDATED'} SUCCESSFULLY        ║
+                    ╚════════════════════════════════════════════════════════╝
+                    
+                    Stack Name:           ${env.STACK_NAME}
+                    Action:               ${params.ACTION}
+                    Asset Group:          ${params.ASSET_GROUP}
+                    
+                    You can now deploy configurations using 'deploy-config' action.
+                    """
+                }
+            }
+        }
+        failure {
+            script {
+                echo """
+                ╔════════════════════════════════════════════════════════╗
+                ║               DEPLOYMENT FAILED                        ║
+                ╚════════════════════════════════════════════════════════╝
+                
+                Please check the logs above for error details.
+                
+                Common issues:
+                - Stack does not exist (use 'create-infra' first)
+                - Invalid JSON in configuration file
+                - AWS credentials or permissions issue
+                - Invalid parameter values
+                """
+            }
+        }
+        always {
+            script {
+                // Cleanup temporary files
+                sh 'rm -f /tmp/current-config.json /tmp/deployed-config.json'
+            }
+        }
+    }
+}

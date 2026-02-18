@@ -1,0 +1,19 @@
+{
+  "featureFlags": {
+    "enableNewAuth": false,
+    "enableRateLimiting": true,
+    "enableAdvancedLogging": false,
+    "enableCaching": true,
+    "enableBetaFeatures": false
+  },
+  "settings": {
+    "sessionTimeout": 3600,
+    "tokenExpiry": 7200,
+    "maxConcurrentRequests": 200,
+    "maxRetryAttempts": 3,
+    "apiTimeout": 45,
+    "cacheExpiry": 900,
+    "logLevel": "info",
+    "environment": "cdc7c"
+  }
+}
