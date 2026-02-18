@@ -4,13 +4,13 @@
     "enableRateLimiting": true,
     "enableAdvancedLogging": true,
     "enableCaching": false,
-    "enableBetaFeatures": true,
-    "maxRetryAttempts": 3
+    "enableBetaFeatures": true
   },
   "settings": {
     "sessionTimeout": 3600,
     "tokenExpiry": 7200,
     "maxConcurrentRequests": 100,
+    "maxRetryAttempts": 3,
     "apiTimeout": 30,
     "cacheExpiry": 300,
     "logLevel": "debug",
