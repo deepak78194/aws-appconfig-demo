@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS AppConfig Infrastructure for Git-based Configuration Management'
+
+Parameters:
+  AssetId:
+    Type: String
+    Description: 'Asset identifier (e.g., 10)'
+    Default: '10'
+    AllowedPattern: '^[0-9]+$'
+    ConstraintDescription: 'Must be a numeric value'
+
+  AssetName:
+    Type: String
+    Description: 'Asset name (e.g., auth, payment, notification)'
+    Default: 'auth'
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: 'Must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens'
+
+  AssetGroup:
+    Type: String
+    Description: 'Asset group/environment (cdc1c, cdc4c, cdc7c, pdc1c)'
+    Default: 'cdc1c'
+    AllowedValues:
+      - cdc1c
+      - cdc4c
+      - cdc7c
+      - pdc1c
+    ConstraintDescription: 'Must be one of: cdc1c, cdc4c, cdc7c, pdc1c'
+
+  AssetService:
+    Type: String
+    Description: 'Service name (e.g., authapi, paymentapi)'
+    Default: 'authapi'
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+    ConstraintDescription: 'Must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens'
+
+  DeployInitialConfig:
+    Type: String
+    Description: 'Whether to deploy an initial configuration (yes/no)'
+    Default: 'no'
+    AllowedValues:
+      - 'yes'
+      - 'no'
+
+  InitialConfigContent:
+    Type: String
+    Description: 'Initial configuration content in JSON format (only used if DeployInitialConfig is yes)'
+    Default: '{"featureFlags": {"enableNewAuth": false}, "settings": {"sessionTimeout": 3600}}'
+
+Conditions:
+  ShouldDeployInitialConfig: !Equals [!Ref DeployInitialConfig, 'yes']
+
+Resources:
+  # AppConfig Application
+  AppConfigApplication:
+    Type: AWS::AppConfig::Application
+    Properties:
+      Name: !Sub '${AssetName}-${AssetId}'
+      Description: !Sub 'AppConfig Application for ${AssetName} (${AssetId}) - ${AssetService}'
+      Tags:
+        - Key: AssetId
+          Value: !Ref AssetId
+        - Key: AssetName
+          Value: !Ref AssetName
+        - Key: AssetGroup
+          Value: !Ref AssetGroup
+        - Key: Service
+          Value: !Ref AssetService
+
+  # AppConfig Environment
+  AppConfigEnvironment:
+    Type: AWS::AppConfig::Environment
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Ref AssetGroup
+      Description: !Sub 'Environment for ${AssetGroup}'
+      Tags:
+        - Key: AssetId
+          Value: !Ref AssetId
+        - Key: AssetName
+          Value: !Ref AssetName
+        - Key: AssetGroup
+          Value: !Ref AssetGroup
+        - Key: Service
+          Value: !Ref AssetService
+
+  # AppConfig Configuration Profile with JSON Schema Validator
+  AppConfigConfigurationProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      Name: !Sub '${AssetService}-config'
+      Description: !Sub 'Configuration profile for ${AssetService}'
+      LocationUri: hosted
+      Type: AWS.AppConfig.FeatureFlags
+      Validators:
+        - Type: JSON_SCHEMA
+          Content: |
+            {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {
+                "featureFlags": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "settings": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": ["featureFlags", "settings"],
+              "additionalProperties": false
+            }
+      Tags:
+        - Key: AssetId
+          Value: !Ref AssetId
+        - Key: AssetName
+          Value: !Ref AssetName
+        - Key: AssetGroup
+          Value: !Ref AssetGroup
+        - Key: Service
+          Value: !Ref AssetService
+
+  # Deployment Strategy: Immediate
+  DeploymentStrategyImmediate:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      Name: !Sub '${AssetName}-${AssetId}-Immediate'
+      Description: 'Immediate deployment with 5 minute bake time'
+      DeploymentDurationInMinutes: 0
+      FinalBakeTimeInMinutes: 5
+      GrowthFactor: 100
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+      Tags:
+        - Key: AssetId
+          Value: !Ref AssetId
+        - Key: AssetName
+          Value: !Ref AssetName
+        - Key: Strategy
+          Value: Immediate
+
+  # Deployment Strategy: Canary
+  DeploymentStrategyCanary:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      Name: !Sub '${AssetName}-${AssetId}-Canary'
+      Description: 'Canary deployment: 10% for 2 mins, then 100% with 5 min bake'
+      DeploymentDurationInMinutes: 10
+      FinalBakeTimeInMinutes: 5
+      GrowthFactor: 10
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+      Tags:
+        - Key: AssetId
+          Value: !Ref AssetId
+        - Key: AssetName
+          Value: !Ref AssetName
+        - Key: Strategy
+          Value: Canary
+
+  # Initial Configuration Version (Optional)
+  InitialHostedConfigurationVersion:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Condition: ShouldDeployInitialConfig
+    Properties:
+      ApplicationId: !Ref AppConfigApplication
+      ConfigurationProfileId: !Ref AppConfigConfigurationProfile
+      Content: !Ref InitialConfigContent
+      ContentType: application/json
+      Description: 'Initial configuration created by CloudFormation'
+
+Outputs:
+  ApplicationId:
+    Description: 'AppConfig Application ID'
+    Value: !Ref AppConfigApplication
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationId'
+
+  EnvironmentId:
+    Description: 'AppConfig Environment ID'
+    Value: !Ref AppConfigEnvironment
+    Export:
+      Name: !Sub '${AWS::StackName}-EnvironmentId'
+
+  ConfigurationProfileId:
+    Description: 'AppConfig Configuration Profile ID'
+    Value: !Ref AppConfigConfigurationProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigurationProfileId'
+
+  DeploymentStrategyImmediateId:
+    Description: 'Deployment Strategy ID for Immediate deployments'
+    Value: !Ref DeploymentStrategyImmediate
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentStrategyImmediateId'
+
+  DeploymentStrategyCanaryId:
+    Description: 'Deployment Strategy ID for Canary deployments'
+    Value: !Ref DeploymentStrategyCanary
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentStrategyCanaryId'
+
+  StackName:
+    Description: 'CloudFormation Stack Name'
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub '${AWS::StackName}-StackName'
+
+  AssetInfo:
+    Description: 'Asset information'
+    Value: !Sub 'AssetId=${AssetId}, AssetName=${AssetName}, AssetGroup=${AssetGroup}, Service=${AssetService}'

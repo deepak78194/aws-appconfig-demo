@@ -1,0 +1,19 @@
+{
+  "featureFlags": {
+    "enableNewAuth": false,
+    "enableRateLimiting": true,
+    "enableAdvancedLogging": false,
+    "enableCaching": true,
+    "enableBetaFeatures": false,
+    "maxRetryAttempts": 5
+  },
+  "settings": {
+    "sessionTimeout": 1800,
+    "tokenExpiry": 3600,
+    "maxConcurrentRequests": 500,
+    "apiTimeout": 60,
+    "cacheExpiry": 1800,
+    "logLevel": "warn",
+    "environment": "pdc1c"
+  }
+}
