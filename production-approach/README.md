@@ -281,12 +281,12 @@ Edit the configuration files to match your service requirements:
 {
   "featureFlags": {
     "enableNewAuth": false,
-    "enableRateLimiting": true,
-    "maxRetryAttempts": 3
+    "enableRateLimiting": true
   },
   "settings": {
     "sessionTimeout": 3600,
     "tokenExpiry": 7200,
+    "maxRetryAttempts": 3,
     "apiTimeout": 30
   }
 }
